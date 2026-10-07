@@ -17,5 +17,5 @@ module load pytorch-gpu/py3/2.8.0
 
 python estimate_precursor_variance_bound_proteometools.py \
     --h5 /lustre/fswork/projects/rech/bun/ucg81ws/these/GraphSpectra/dataset/raw_dataset/traintest_hcd.hdf5 \
-    --group-by-ce --min-replicates 1 \
+    --group-by-ce --min-replicates 1 --optimize-steps 0 \
     --out-dir logs/precursor_variance_bound_proteometools_traintest
