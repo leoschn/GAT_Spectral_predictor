@@ -59,8 +59,10 @@ def parse_args():
                         help="Sequence column defining the precursor (default: modified sequence)")
     parser.add_argument("--group-by-ce", action="store_true",
                         help="Also split precursors by collision energy")
-    parser.add_argument("--ce-decimals", type=int, default=0,
-                        help="Rounding applied to collision energy when --group-by-ce is set")
+    parser.add_argument("--ce-decimals", type=int, default=None,
+                        help="Rounding applied to collision energy when --group-by-ce is set "
+                             "(default: exact value, as seen by the model; CE is normalized, "
+                             "e.g. 0.25, so rounding to 0 decimals would merge all energies)")
     parser.add_argument("--min-replicates", type=int, default=2,
                         help="Only precursors with at least this many spectra are scored")
     parser.add_argument("--optimize-steps", type=int, default=200,
@@ -105,8 +107,11 @@ def load_data(args):
 def group_ids(meta, args):
     keys = [args.seq_col, "charge"]
     if args.group_by_ce:
-        meta["ce_key"] = meta[ENERGY_COL].round(args.ce_decimals)
+        ce = meta[ENERGY_COL]
+        meta["ce_key"] = ce if args.ce_decimals is None else ce.round(args.ce_decimals)
         keys.append("ce_key")
+        print(f"Collision energies: {meta['ce_key'].nunique()} distinct values "
+              f"{sorted(meta['ce_key'].unique())[:10]}")
     gid, _ = pd.MultiIndex.from_frame(meta[keys]).factorize()
     return gid, keys
 
