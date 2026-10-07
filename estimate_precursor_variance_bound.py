@@ -70,6 +70,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--chunk-size", type=int, default=200_000,
                         help="Number of CSV rows read at once")
+    parser.add_argument("--batch-rows", type=int, default=500_000,
+                        help="Spectra processed at once on the device (bounds peak memory)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", default="logs/precursor_variance_bound",
                         help="Where per-spectrum / per-precursor CSVs and summary are written")
@@ -127,21 +129,51 @@ def group_sum(x, gid, n_groups):
     return out.index_add_(0, gid, x)
 
 
-def optimize_barycenter(y, gid, init, counts, steps, lr):
+def row_batches(n, size):
+    for start in range(0, n, size):
+        yield slice(start, min(start + size, n))
+
+
+def batched_distance(y, pred_fn, batch_rows):
+    """masked_spectral_distance(y, pred) computed `batch_rows` spectra at a
+    time; `pred_fn(rows)` builds the predictions for the slice `rows`."""
+    return torch.cat([masked_spectral_distance(y[rows], pred_fn(rows))
+                      for rows in row_batches(len(y), batch_rows)])
+
+
+def optimize_barycenter(y, gid, init, counts, steps, lr, batch_rows):
     """Minimize the per-precursor mean masked spectral distance directly
-    (each precursor's term is independent, so summing them is fine)."""
+    (each precursor's term is independent, so summing them is fine).
+    Gradients are accumulated over row batches to bound peak memory."""
     param = init.clone().requires_grad_(True)
     opt = torch.optim.Adam([param], lr=lr)
     weights = 1.0 / counts[gid].float()
-    for step in range(steps):
+    # Adam can overshoot on tight precursors: keep each precursor's best
+    # iterate so the result is never worse than the in-sample barycenter.
+    best = init.clone()
+    best_loss = torch.full_like(counts, float("inf"))
+    for step in range(steps + 1):
         opt.zero_grad()
-        loss = (masked_spectral_distance(y, param[gid]) * weights).sum() / len(counts)
-        loss.backward()
+        dist = []
+        for rows in row_batches(len(y), batch_rows):
+            d = masked_spectral_distance(y[rows], param[gid[rows]])
+            if step < steps:
+                ((d * weights[rows]).sum() / len(counts)).backward()
+            dist.append(d.detach())
+        dist = torch.cat(dist)
+        with torch.no_grad():
+            per_precursor = group_sum(dist[:, None], gid, len(counts)).squeeze(1) / counts
+            improved = per_precursor < best_loss
+            best[improved] = param[improved]
+            best_loss = torch.minimum(best_loss, per_precursor)
+        if step % 50 == 0 or step == steps:
+            print(f"  [optimize] step {step:4d}  mean-per-precursor SA = {per_precursor.mean().item():.5f}"
+                  f"  (best {best_loss.mean().item():.5f})")
+        if step == steps:
+            break
         opt.step()
-        if step % 50 == 0 or step == steps - 1:
-            print(f"  [optimize] step {step:4d}  mean-per-precursor SA = {loss.item():.5f}")
     # Negative intensities can only lower the cosine with non-negative spectra.
-    return param.detach().clamp_min(0.0)
+    return best.clamp_min(0.0)
 
 
 def summarize(name, dist, gid, counts):
@@ -158,14 +190,12 @@ def summarize(name, dist, gid, counts):
     }
 
 
-def main():
-    args = parse_args()
+def run_bound(y_np, meta, gid_np, keys, args, breakdown_cols=("ptm_type",)):
+    """Score the in-sample / leave-one-out / optimized barycenters of the
+    precursor groups `gid_np` and write the per-spectrum, summary and
+    per-`breakdown_cols` results to `args.out_dir`."""
     device = torch.device(args.device)
     os.makedirs(args.out_dir, exist_ok=True)
-
-    print(f"Reading {args.csv}")
-    y_np, meta = load_data(args)
-    gid_np, keys = group_ids(meta, args)
 
     counts_all = np.bincount(gid_np)
     keep = counts_all[gid_np] >= args.min_replicates
@@ -187,24 +217,27 @@ def main():
 
     # All replicates share sequence + charge, hence the same -1 mask, so the
     # barycenter is well defined position-wise.
-    y_norm = normalize_masked(y)
-    sums = group_sum(y_norm, gid, n_groups)
+    sums = torch.zeros(n_groups, y.shape[1], dtype=y.dtype, device=device)
+    for rows in row_batches(len(y), args.batch_rows):
+        sums.index_add_(0, gid[rows], normalize_masked(y[rows]))
 
     results = {}
 
     # 1. In-sample barycenter (normalized mean of the normalized spectra).
     bary = sums / counts[:, None]
-    results["in_sample"] = masked_spectral_distance(y, bary[gid])
+    results["in_sample"] = batched_distance(y, lambda rows: bary[gid[rows]], args.batch_rows)
 
     # 2. Leave-one-out barycenter: mean of the other n-1 replicates.
-    loo = sums[gid] - y_norm
-    results["leave_one_out"] = masked_spectral_distance(y, loo)
+    results["leave_one_out"] = batched_distance(
+        y, lambda rows: sums[gid[rows]] - normalize_masked(y[rows]), args.batch_rows)
 
     # 3. Barycenter optimized on the exact metric.
     if args.optimize_steps > 0:
-        opt_bary = optimize_barycenter(y, gid, bary, counts, args.optimize_steps, args.lr)
+        opt_bary = optimize_barycenter(y, gid, bary, counts, args.optimize_steps, args.lr,
+                                       args.batch_rows)
         with torch.no_grad():
-            results["optimized"] = masked_spectral_distance(y, opt_bary[gid])
+            results["optimized"] = batched_distance(y, lambda rows: opt_bary[gid[rows]],
+                                                    args.batch_rows)
 
     summary = pd.DataFrame([summarize(k, v, gid, counts) for k, v in results.items()])
     with pd.option_context("display.float_format", "{:.5f}".format, "display.width", 200):
@@ -217,17 +250,27 @@ def main():
     for k, v in results.items():
         per_spectrum[f"sa_{k}"] = v.cpu().numpy()
 
-    if "ptm_type" in per_spectrum.columns:
-        sa_cols = [f"sa_{k}" for k in results]
-        by_ptm = per_spectrum.groupby("ptm_type")[sa_cols].mean()
-        by_ptm.insert(0, "n_spectra", per_spectrum.groupby("ptm_type").size())
+    sa_cols = [f"sa_{k}" for k in results]
+    for col in breakdown_cols:
+        if col not in per_spectrum.columns:
+            continue
+        by_col = per_spectrum.groupby(col)[sa_cols].mean()
+        by_col.insert(0, "n_spectra", per_spectrum.groupby(col).size())
         with pd.option_context("display.float_format", "{:.5f}".format, "display.width", 200):
-            print("\nMean spectral distance per PTM type:\n" + by_ptm.to_string())
-        by_ptm.to_csv(os.path.join(args.out_dir, "by_ptm_type.csv"))
+            print(f"\nMean spectral distance per {col}:\n" + by_col.to_string())
+        by_col.to_csv(os.path.join(args.out_dir, f"by_{col}.csv"))
 
     per_spectrum.to_csv(os.path.join(args.out_dir, "per_spectrum.csv"), index=False)
     summary.to_csv(os.path.join(args.out_dir, "summary.csv"), index=False)
     print(f"\nResults written to {args.out_dir}")
+
+
+def main():
+    args = parse_args()
+    print(f"Reading {args.csv}")
+    y_np, meta = load_data(args)
+    gid_np, keys = group_ids(meta, args)
+    run_bound(y_np, meta, gid_np, keys, args)
 
 
 if __name__ == "__main__":
