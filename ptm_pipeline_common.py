@@ -72,6 +72,9 @@ OUTPUT_COLUMNS = [
     "sequence_no_mod",
     "precursor_charge_onehot",
     "collision_energy",
+    "raw_file",
+    "scan_number",
+    "score",
     "ptm_type",
 ]
 
@@ -87,7 +90,16 @@ OUTPUT_COLUMNS = [
 PRIDE_ROOT = "/lustre/fsn1/projects/rech/bun/ucg81ws/data/pride"
 
 # Root everything this pipeline produces gets written under.
-OUTPUT_ROOT = "/lustre/fsn1/projects/rech/bun/ucg81ws/ptm_datasets"
+# New root for the Prosit 2019 processing (FTMS only, score > 50, top 3,
+# intensities re-annotated from the raw spectra, NCE units): the CSVs and
+# feature stores are resumable and keyed by row_id, so pointing at the old
+# root would silently reuse graphs built from the previous selection.
+OUTPUT_ROOT = "/lustre/fsn1/projects/rech/bun/ucg81ws/ptm_datasets_prosit2019"
+
+# msms.txt annotated with RAW acquisition metadata + peak lists (~1 GB per
+# source). Kept under OUTPUT_ROOT so the raw PRIDE folders, and the
+# annotated files earlier datasets were built from, are never overwritten.
+ANNOTATED_DIR = os.path.join(OUTPUT_ROOT, "annotated_msms")
 
 # Combined, row_id-tagged CSV + shared feature store for the 21
 # PTM-modified sources. Both dataset 1 and dataset 2 read/write here.
@@ -142,8 +154,8 @@ _PTM_MOD_CODES = [
 ]
 
 _PTM_MOD_CODES_MODIFIED = [
-    None, None, None, None, None, None, None, None, None, "gy", None, "ds",
-    None, None, "da", None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, "gy", None, "da",
+    None, None, "ds", None, None, None, None, None, None,
 ]
 
 assert len(_PTM_FOLDERS) == 21
@@ -195,7 +207,8 @@ def build_ptm_type_csv(entry, pride_root, out_csv, force=False):
         return pd.read_csv(out_csv)
 
     full_path, raw_dir = raw_msms_paths(entry["folder"], pride_root)
-    annotated_path = full_path + "_annotated.txt"
+    os.makedirs(ANNOTATED_DIR, exist_ok=True)
+    annotated_path = os.path.join(ANNOTATED_DIR, entry["folder"] + "_msms_annotated.txt")
 
     print(f"Annotating {full_path}.txt ...")
     annotate_msms_with_acquisition(
@@ -240,7 +253,8 @@ def build_unmod_csv(entry, pride_root, out_csv, force=False):
         return pd.read_csv(out_csv)
 
     full_path, raw_dir = raw_msms_paths(entry["folder"], pride_root)
-    annotated_path = full_path + "_annotated.txt"
+    os.makedirs(ANNOTATED_DIR, exist_ok=True)
+    annotated_path = os.path.join(ANNOTATED_DIR, entry["folder"] + "_msms_annotated.txt")
 
     print(f"Annotating {full_path}.txt ...")
     annotate_msms_with_acquisition(
@@ -252,7 +266,7 @@ def build_unmod_csv(entry, pride_root, out_csv, force=False):
     dummy_col = "__no_ptm_prob__"
     df_annot = pd.read_csv(annotated_path, sep="\t", low_memory=False)
     df_annot[dummy_col] = np.nan
-    dummy_annotated_path = full_path + "_annotated_unmod.txt"
+    dummy_annotated_path = os.path.join(ANNOTATED_DIR, entry["folder"] + "_msms_annotated_unmod.txt")
     df_annot.to_csv(dummy_annotated_path, sep="\t", index=False)
 
     tmp_csv = out_csv + ".raw.csv"

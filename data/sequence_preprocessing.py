@@ -44,6 +44,8 @@ def annotate_msms_with_acquisition(
     RAW Collision energy
     RAW ETD parameter
     RAW Supplemental activation
+    RAW masses
+    RAW intensities
     Fragmentation match
     """
 
@@ -459,7 +461,9 @@ def annotate_msms_with_acquisition(
                 raw_msms_file,
                 usecols=[
                     "scan_number",
-                    "scan_type"
+                    "scan_type",
+                    "masses",
+                    "intensities"
                 ],
                 low_memory=False
             )
@@ -468,8 +472,8 @@ def annotate_msms_with_acquisition(
 
             print(
                 "  WARNING: Required columns "
-                "'scan_number' and/or 'scan_type' "
-                "not found."
+                "'scan_number', 'scan_type', 'masses' "
+                "and/or 'intensities' not found."
             )
 
             continue
@@ -521,6 +525,12 @@ def annotate_msms_with_acquisition(
 
         raw_df["Raw file"] = raw_file_name
 
+        # Full peak list, re-annotated in convert_msms_to_prosit
+        raw_df = raw_df.rename(columns={
+            "masses": "RAW masses",
+            "intensities": "RAW intensities"
+        })
+
 
         # --------------------------------------------------------
         # Keep only required metadata
@@ -535,7 +545,9 @@ def annotate_msms_with_acquisition(
                 "RAW Fragmentation",
                 "RAW Collision energy",
                 "RAW ETD parameter",
-                "RAW Supplemental activation"
+                "RAW Supplemental activation",
+                "RAW masses",
+                "RAW intensities"
             ]
         ]
 
@@ -1091,47 +1103,136 @@ def convert_sequence(seq):
 
 
 # ----------------------------------------------------------
-# Parse ion annotation
-# Examples:
+# Raw-spectrum fragment annotation (Prosit 2019)
 #
-# b5
-# y7
-# b4(2+)
-# y10(3+)
-#
-# Ignore:
-# y5-H2O
-# b7-NH3
-# a ions
-# M ions
+# Re-implements kusterlab/prosit (match.py, annotate.py, constants.py):
+# b/y ions at every fragment charge up to the precursor charge, with and
+# without H2O/NH3 loss, matched at 25 ppm on FTMS by Prosit's binary
+# search. Only the 174 no-loss, charge <= 3 entries are kept, but the
+# spectrum is divided by the most intense of *all* matched ions -- which is
+# why ~5% of the Prosit HDF5 rows peak below 1.
 # ----------------------------------------------------------
 
-ion_regex = re.compile(r"^([by])(\d+)(?:\((\d)\+\))?$")
+PROTON = 1.007276467
+H = 1.007825035
+O = 15.99491463
+N = 14.003074
+H2O = 2 * H + O
+NH3 = N + 3 * H
+NEUTRAL_LOSSES = (0.0, H2O, NH3)
+
+FTMS_TOLERANCE_PPM = 25
+MAX_FRAGMENT_NUMBER = 29
+MAX_FRAGMENT_CHARGE = 3
+
+# Prosit residue masses; C carries the fixed carbamidomethylation used in
+# every PXD009449 search.
+AMINO_ACID_MASS = {
+    "G": 57.021464, "R": 156.101111, "V": 99.068414, "P": 97.052764,
+    "S": 87.032028, "L": 113.084064, "M": 131.040485, "Q": 128.058578,
+    "N": 114.042927, "Y": 163.063329, "E": 129.042593,
+    "C": 103.009185 + 57.0214637236, "F": 147.068414, "I": 113.084064,
+    "A": 71.037114, "T": 101.047679, "W": 186.079313, "H": 137.058912,
+    "D": 115.026943, "K": 128.094963,
+}
+
+# Monoisotopic mass shifts of the modification codes found in `sequence`
+# (after the mod_code_modified renaming), from the compositions in the
+# MaxQuant 1.5.3.30 conf/modifications.xml shipped with PXD009449.
+PTM_MASS = {
+    "M(ox)": 15.994915,
+    "K(fo)": 27.994915,   # Formyl
+    "K(pr)": 56.026215,   # Propion
+    "K(ac)": 42.010565,   # Acetyl
+    "K(gl)": 114.031694,  # Glutaryl
+    "K(su)": 100.016044,  # Succinyl
+    "K(bi)": 226.077598,  # Biotin
+    "K(gy)": 114.042927,  # GlyGly
+    "K(tr)": 42.04695,    # Trimethyl
+    "K(bu)": 70.041865,   # Butyryl
+    "K(hy)": 86.036779,   # Hydroxyisobutyryl
+    "K(di)": 28.0313,     # Dimethyl
+    "K(cr)": 68.026215,   # Crotonyl
+    "K(ma)": 86.000394,   # Malonyl
+    "K(me)": 14.01565,    # Methyl
+    "R(ci)": 0.984016,    # Citrullin
+    "R(ds)": 28.0313,     # Dimethyl, symmetric (SDMA)
+    "R(da)": 28.0313,     # Dimethyl, asymmetric (ADMA)
+    "R(me)": 14.01565,    # Methyl
+    "Y(ni)": 44.985078,   # Nitrotyrosine
+    "Y(ph)": 79.96633,    # Phospho
+    "P(hy)": 15.994915,   # Hydroxyproline
+}
+
+residue_regex = re.compile(r"[A-Z](?:\([a-z]+\))?")
 
 
-def parse_ion(annotation):
+def residue_masses(sequence):
+    """'AK(ac)M(ox)R' -> per-residue masses. Raises KeyError on an unknown
+    residue or modification code."""
+    tokens = residue_regex.findall(sequence)
+    if "".join(tokens) != sequence:
+        raise ValueError(f"Cannot parse sequence: {sequence}")
+    return np.array([
+        AMINO_ACID_MASS[t[0]] + (PTM_MASS[t] if len(t) > 1 else 0.0)
+        for t in tokens
+    ])
 
-    annotation = annotation.strip()
 
-    if "-" in annotation:
-        return None
+def prosit_binarysearch(masses, theoretical, tolerance_ppm):
+    """Prosit's match.binarysearch: index of *a* peak (the first one the
+    search lands on, not necessarily the most intense) within
+    `theoretical * tolerance_ppm` of the theoretical m/z, or None."""
+    tolerance = theoretical * tolerance_ppm / 10 ** 6
+    lo, hi = 0, len(masses) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if masses[mid] - tolerance <= theoretical <= masses[mid] + tolerance:
+            return mid
+        elif masses[mid] < theoretical:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return None
 
-    if annotation.startswith("a"):
-        return None
 
-    m = ion_regex.match(annotation)
+def annotate_raw_spectrum(sequence, precursor_charge, masses, intensities,
+                          tolerance_ppm=FTMS_TOLERANCE_PPM):
+    """
+    Returns (vector, base_peak): raw intensities of the 174 Prosit entries
+    (0 where unmatched; impossible entries are masked by the caller) and
+    the intensity of the most intense matched ion over every charge and
+    neutral loss, used for normalization.
+    """
+    order = np.argsort(masses, kind="stable")
+    masses, intensities = masses[order], intensities[order]
 
-    if m is None:
-        return None
+    residues = residue_masses(sequence)
+    forward = np.cumsum(residues)[:-1]
+    backward = np.cumsum(residues[::-1])[:-1]
 
-    ion_type = m.group(1)
-    number = int(m.group(2))
+    vector = np.zeros(174, dtype=float)
+    base_peak = 0.0
+    for charge in range(1, precursor_charge + 1):
+        for ion_type, cumulative, ion_offset in (("b", forward, 0.0), ("y", backward, H2O)):
+            for number, fragment_mass in enumerate(cumulative, start=1):
+                for loss in NEUTRAL_LOSSES:
+                    mz = (fragment_mass - loss + ion_offset + charge * PROTON) / charge
+                    index = prosit_binarysearch(masses, mz, tolerance_ppm)
+                    if index is None:
+                        continue
+                    intensity = intensities[index]
+                    base_peak = max(base_peak, intensity)
+                    if loss == 0.0 and charge <= MAX_FRAGMENT_CHARGE and number <= MAX_FRAGMENT_NUMBER:
+                        vector[prosit_index(ion_type, number, charge)] = intensity
+    return vector, base_peak
 
-    charge = 1
-    if m.group(3):
-        charge = int(m.group(3))
 
-    return ion_type, number, charge
+def parse_peak_list(values):
+    """Space-separated .raw.msms peak list -> float array (empty if NaN)."""
+    if pd.isna(values) or str(values).strip() == "":
+        return np.empty(0)
+    return np.array(str(values).split(), dtype=float)
 
 
 # ----------------------------------------------------------
@@ -1148,13 +1249,41 @@ def convert_msms_to_prosit(
     prob_col_name='Crotonyl (K) Probabilities',
     low=0.05,
     high=0.95,
+    mass_analyzer_filter='FTMS',
+    min_score=50,
+    exclude_decoys=True,
+    top_n=3,
 ):
+    """
+    Defaults reproduce the Prosit 2019 training-data selection, as observed
+    in its released HDF5 files: Orbitrap (FTMS) HCD spectra only, no decoys,
+    Andromeda score > 50, and at most the `top_n` best-scoring spectra per
+    (modified sequence, precursor charge, collision energy, raw file).
+
+    Fragment intensities are re-annotated from the raw peak list carried by
+    `annotate_msms_with_acquisition` (see `annotate_raw_spectrum`), not taken
+    from MaxQuant's Matches/Intensities, which drop many 2+/3+ fragments.
+
+    `collision_energy` is the nominal NCE of the scan in NCE units (not /100),
+    the scale of the `collision_energy_aligned` field fed to the model for
+    ProteomeTools. No per-raw-file calibration is applied.
+    """
 
     df = pd.read_csv(msms_file, sep="\t", low_memory=False)
     #only keep relevant frag type if filter is specified
     if fragmentation_filter is not None :
         df = df[df['RAW Fragmentation']==fragmentation_filter]
+    # Prosit 2019 HCD data is Orbitrap-only: the ion-trap HCD scans of the
+    # 2xIT_2xHCD runs are low-resolution and absent from its HDF5 files.
+    if mass_analyzer_filter is not None:
+        df = df[df['RAW Mass analyzer'] == mass_analyzer_filter]
+    if exclude_decoys:
+        df = df[df['Reverse'] != '+']
+    if min_score is not None:
+        df = df[df['Score'] > min_score]
+
     results = []
+    unknown_residues = {}
 
     for _, row in df.iterrows():
 
@@ -1185,6 +1314,10 @@ def convert_msms_to_prosit(
         sequence = convert_sequence(sequence)
         seq_length = len(sequence) - 4*sequence.count('(') #to account for PTMs
 
+        # Rename before annotation: PTM_MASS is keyed by the final codes
+        if mod_code_modified != None:
+            sequence=sequence.replace(residue+'('+mod_code+')',residue+'('+mod_code_modified+')')
+
         precursor_charge = int(row["Charge"])
 
         intensity_norm_vector = np.zeros(174, dtype=float)
@@ -1210,69 +1343,23 @@ def convert_msms_to_prosit(
         intensity_norm_vector[impossible_index] = -1
         intensity_raw_vector[impossible_index] = -1
 
-        matches = str(row["Matches"]).split(";")
-        intensities = str(row["Intensities"]).split(";")
-
-        parsed = []
-
-        for ion, inten in zip(matches, intensities):
-
-            p = parse_ion(ion)
-
-            if p is None:
-                continue
-
-            try:
-                inten = float(inten)
-            except:
-                continue
-
-            parsed.append((p, inten))
-
-        if len(parsed) == 0:
+        try:
+            raw_vector, base_peak = annotate_raw_spectrum(
+                sequence,
+                precursor_charge,
+                parse_peak_list(row["RAW masses"]),
+                parse_peak_list(row["RAW intensities"]),
+            )
+        except KeyError as exc:
+            unknown_residues[str(exc)] = unknown_residues.get(str(exc), 0) + 1
             continue
 
-        valid_parsed = []
-        for p, inten in parsed:
-            # Unpack the tuple properly
-            ion_type, number, charge = p
-            idx = prosit_index(ion_type, number, charge)
-            if idx is not None:
-                valid_parsed.append((idx, inten))
-
-        if not valid_parsed:
+        # No b/y ion matched at all
+        if base_peak == 0:
             continue
 
-        # Now max_intensity is strictly within the 174-dimension bounds
-        max_intensity = max(i for _, i in valid_parsed)
-
-        if max_intensity == 0:
-            continue
-
-        for (ion_type, number, charge), inten in parsed:
-
-            idx = prosit_index(ion_type, number, charge)
-
-            if idx is None:
-                continue
-
-            norm = inten / max_intensity
-
-            # keep largest intensity if duplicated
-            if intensity_norm_vector[idx] != -1:
-                intensity_norm_vector[idx] = max(
-                    intensity_norm_vector[idx],
-                    norm
-                )
-
-            if intensity_raw_vector[idx] != -1:
-                intensity_raw_vector[idx] = max(
-                    intensity_raw_vector[idx],
-                    inten
-                )
-
-        if mod_code_modified != None:
-            sequence=sequence.replace(residue+'('+mod_code+')',residue+'('+mod_code_modified+')')
+        intensity_raw_vector[~impossible_index] = raw_vector[~impossible_index]
+        intensity_norm_vector[~impossible_index] = raw_vector[~impossible_index] / base_peak
 
         is_modified = '(' in sequence
 
@@ -1281,14 +1368,36 @@ def convert_msms_to_prosit(
             "intensities_raw": intensity_raw_vector.tolist(),
             "sequence": sequence,
             "sequence_no_mod":sequence_no_mod,
+            "precursor_charge": precursor_charge,
             "precursor_charge_onehot": charge_onehot(
                 precursor_charge
             ),
-            "collision_energy": row['RAW Collision energy'],
+            # annotate_msms_with_acquisition stores NCE / 100
+            "collision_energy": round(row['RAW Collision energy'] * 100, 4),
             "is_modified": is_modified,
+            "raw_file": row['Raw file'],
+            "scan_number": row['Scan number'],
+            "score": row['Score'],
         })
 
+    if unknown_residues:
+        print(f"WARNING: spectra dropped for unknown residue/modification codes: {unknown_residues}")
+
     out = pd.DataFrame(results)
+
+    # Prosit 2019: keep the top_n best Andromeda scores per precursor and
+    # collision energy within each raw file (its HDF5 files hold at most 3
+    # spectra per (sequence, charge, CE, raw file), more across raw files).
+    # Done after localization so discarded ambiguous PSMs don't use a slot.
+    if top_n is not None and len(out) > 0:
+        n_before = len(out)
+        out = (
+            out.sort_values("score", ascending=False, kind="stable")
+            .groupby(["sequence", "precursor_charge", "collision_energy", "raw_file"], sort=False)
+            .head(top_n)
+            .sort_index()
+        )
+        print(f"Top-{top_n} selection: {n_before} -> {len(out)} spectra")
 
     out.to_csv(output_file, index=False)
 
